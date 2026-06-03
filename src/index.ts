@@ -22,7 +22,7 @@ export interface KubekExtensionManifest {
   author?: { name: string; url?: string; email?: string };
   license?: string;
   homepage?: string;
-  /** path to svg/png inside the package */
+  /** path to a .png inside the package, or an emoji/text icon */
   icon?: string;
   keywords?: string[];
 
