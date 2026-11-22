@@ -52,7 +52,9 @@ export interface PermissionDef {
     group?: string;
 }
 /** Closed capability set, host grants only approved ones */
-export type Capability = "events:server" | "events:logs" | "events:tasks" | "events:backups" | "events:players" | "events:auth" | "events:files" | "servers:read" | "servers:control" | "http:routes" | "http:outbound" | "storage" | "settings" | "commands" | "tasks";
+export type Capability = "events:server" | "events:logs" | "events:tasks" | "events:backups" | "events:players" | "events:auth" | "events:files" | "servers:read" | "servers:control" | "http:routes" | "http:outbound" | "storage" | "settings" | "commands" | "tasks"
+/** run programs from the extension data dir, see ctx.processes. @since Kubek 4.1.3 */
+ | "process:spawn";
 export interface BackendManifest {
     /** "backend/index.ts" */
     entry: string;
@@ -150,6 +152,8 @@ export interface KubekExtensionContext {
     commands: {
         register(cmd: ExtCommand): void;
     };
+    /** process:spawn, @since Kubek 4.1.3 */
+    processes: ExtProcessesApi;
 }
 export interface ExtLogger {
     info(msg: string, meta?: unknown): void;
@@ -238,6 +242,19 @@ export interface ExtServersApi {
     /** servers:control */
     stop(id: string): Promise<void>;
     onLog(id: string, cb: (line: InstanceLog) => void): Unsubscribe;
+    /**
+     * Ports the server listens on 127.0.0.1, server.properties wins for the primary one
+     * @since Kubek 4.1.3
+     */
+    ports(id: string): Promise<ServerPort[]>;
+}
+export interface ServerPort {
+    /** blueprint port key, e.g. "game" or "bedrock" */
+    key: string;
+    port: number;
+    protocol: "tcp" | "udp" | "tcp+udp";
+    /** the port players connect to */
+    primary: boolean;
 }
 export interface ServerSummary {
     id: string;
@@ -277,6 +294,11 @@ export interface ExtUser {
     username: string;
     isAdmin?: boolean;
     permissions: string[];
+    /**
+     * Servers this user may touch, "all" when not restricted. Check it before acting on a server
+     * from a route, the route permission alone is panel wide. @since Kubek 4.1.3
+     */
+    servers?: "all" | string[];
 }
 export interface KeyValueStore {
     get<T = unknown>(key: string): T | null;
@@ -304,6 +326,32 @@ export interface ExtCommand {
     permission?: string;
     run(): void | Promise<void>;
 }
+/** Helper programs like tunnel clients, the host kills them when the extension is disabled or the panel stops */
+export interface ExtProcessesApi {
+    spawn(options: ExtSpawnOptions): ExtProcess;
+}
+export interface ExtSpawnOptions {
+    /** absolute path or a program on PATH */
+    command: string;
+    args?: string[];
+    /** relative to dataDir and must stay inside it, dataDir by default */
+    cwd?: string;
+    /** added on top of the panel environment */
+    env?: Record<string, string>;
+    /** kept open when true, see ExtProcess.write */
+    stdin?: boolean;
+}
+export interface ExtProcess {
+    readonly pid: number | undefined;
+    /** stdout and stderr split into lines, ANSI colors left as is */
+    onLine(cb: (line: string, stream: "stdout" | "stderr") => void): Unsubscribe;
+    /** exit code, null when killed by a signal */
+    readonly exited: Promise<number | null>;
+    /** needs stdin: true */
+    write(data: string): void;
+    /** SIGTERM, then SIGKILL after graceMs (default 5000) */
+    kill(graceMs?: number): Promise<void>;
+}
 /** Instance log line (mirrors the internal IInstanceLog). */
 export interface InstanceLog {
     type: "stdout" | "stderr" | "kubek";
@@ -326,7 +374,11 @@ export interface KubekFrontendModule {
 export interface KubekRuntime {
     /** the panel's React namespace (createElement, hooks, …) */
     React: any;
-    /** shadcn-style UI kit: Button, Input, Label, Badge, Separator, Card, CardContent, CardHeader, CardTitle, … */
+    /**
+     * shadcn-style UI kit: Button, Input, Label, Badge, Separator, Card, CardContent, CardHeader, CardTitle,
+     * and since Kubek 4.1.3 Switch, Alert, AlertTitle, AlertDescription, Dialog, DialogContent, DialogHeader,
+     * DialogTitle, DialogDescription, DialogBody, DialogFooter, Tooltip, TooltipTrigger, TooltipContent
+     */
     ui: Record<string, any>;
     /** lucide-react icon components by name */
     icons: Record<string, any>;
@@ -362,6 +414,11 @@ export interface KubekRuntime {
         useAuthStore: () => unknown;
         useTranslation: () => {
             t: (key: string) => string;
+        };
+        /** streamer mode masking for addresses and secrets, @since Kubek 4.1.3 */
+        useStreamerMask?: () => {
+            text: (value: string) => string;
+            enabled: boolean;
         };
     };
     /** navigate within the panel SPA */
