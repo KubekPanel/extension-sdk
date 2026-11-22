@@ -1,6 +1,6 @@
 {
   "name": "@kubekpanel/extension-sdk",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Type contract for Kubek panel extensions",
   "license": "MIT",
   "author": "KubekPanel",

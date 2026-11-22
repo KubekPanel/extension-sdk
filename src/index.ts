@@ -36,6 +36,10 @@ export interface KubekExtensionManifest {
   backend?: BackendManifest;
   /** omit for a background-only extension */
   frontend?: FrontendManifest;
+  /**
+   * The panel builds the settings form of the extension from this, read the values with ctx.config.
+   * Needs the "settings" capability for ctx.config
+   */
   settingsSchema?: SettingField[];
   signature?: ExtensionSignature;
 }
@@ -48,7 +52,7 @@ export interface ExtensionPermissions {
 }
 
 export interface PermissionDef {
-  /** e.g. "ext.discord.configure" */
+  /** e.g. "ext.discord.configure", core keys like "file_manager" are refused */
   key: string;
   label: string;
   /** grouping in the permission-granting UI */
@@ -78,7 +82,7 @@ export type Capability =
 export interface BackendManifest {
   /** "backend/index.ts" */
   entry: string;
-  /** default: in-process */
+  /** default: in-process, any other value is refused at install */
   isolation?: "in-process" | "worker";
   /** for lazy activation */
   events?: ExtEventName[];
@@ -104,7 +108,10 @@ export interface SidebarContribution {
   label: string;
   /** lucide icon name */
   icon: string;
-  /** /ext/<route> */
+  /**
+   * "<extId>/<Component>": the page opens at /ext?view=<extId>/<Component> and renders that
+   * component of the frontend bundle
+   */
   route: string;
   /** permission required for visibility */
   permission?: string;
@@ -139,6 +146,10 @@ export interface SlotContribution {
   order?: number;
 }
 
+/**
+ * server.sidebar is the card column next to the console, context is { serverId }. login.footer
+ * renders on the login page before anyone is signed in, keep it to public content
+ */
 export type SlotName =
   | "dashboard.header"
   | "server.toolbar"
@@ -148,17 +159,21 @@ export type SlotName =
   | "settings.footer"
   | "login.footer";
 
-/** Declarative settings form field (settingsSchema). */
+/** Declarative settings form field (settingsSchema), ctx.config.get returns default until it is saved */
 export interface SettingField {
   key: string;
   type: "string" | "number" | "boolean" | "select" | "multiselect" | "secret";
   label: string;
   description?: string;
   default?: unknown;
-  /** value not returned to the frontend in cleartext */
+  /** never sent to the browser, the form only shows whether it is set. type "secret" implies it */
   secret?: boolean;
+  /** required for select and multiselect */
   options?: string[];
-  /** "required|url|min:1" (laravel-like) */
+  /**
+   * "required|url|min:1|max:64", checked when the form is saved. min and max compare numbers by
+   * value and strings by length, unknown rules are ignored
+   */
   rules?: string;
 }
 
@@ -199,8 +214,16 @@ export interface ExtLogger {
   error(msg: string, meta?: unknown): void;
 }
 
+/**
+ * Handlers run after the code that published the event, a throwing handler is logged and never
+ * breaks the panel or other handlers. Subscriptions end when the extension is disabled
+ */
 export interface ExtEvents {
+  /** panel events, each needs its events:* capability */
   on<K extends ExtEventName>(event: K, handler: (p: ExtEventMap[K]) => void): Unsubscribe;
+  /** events extensions emit, no capability needed */
+  on(event: `ext.${string}`, handler: (p: unknown) => void): Unsubscribe;
+  /** the name must start with "ext.", anything else throws, so core events cannot be faked */
   emit(event: `ext.${string}`, payload: unknown): void;
 }
 
@@ -208,20 +231,32 @@ export interface ExtEvents {
 export type ExtEventName = keyof ExtEventMap;
 
 export interface ExtEventMap {
+  /** the server row exists, its files may still be installing, task.completed tells when */
   "server.created": { serverId: string; name: string; blueprintId: string };
+  /** the process was started, the game is not up yet */
   "server.started": { serverId: string; pid?: number; port?: number };
+  /** the game finished loading and accepts players */
   "server.running": { serverId: string };
+  /** every stop, a crash included */
   "server.stopped": { serverId: string; exitCode: number | null };
+  /** a crash fires server.stopped first and then this */
   "server.crashed": { serverId: string; exitCode: number | null; restartAttempts: number };
   "server.log": { serverId: string; line: InstanceLog };
   "server.error": { serverId: string; errorType: string; severity: ErrorSeverity };
   "server.deleted": { serverId: string };
   "task.created": { taskId: string; type: string };
-  "task.completed": { taskId: string; status: "success" | "failed"; result?: unknown };
+  "task.completed": { taskId: string; status: "success" | "failed" | "cancelled"; result?: unknown };
+  /** after the archive is written and checked, a failed backup fires nothing */
   "backup.created": { serverId: string; backupId: string };
+  /** from the Kubek Companion plugin, player is the name */
   "player.joined": { serverId: string; player: string };
+  /** from the Kubek Companion plugin, kicks included */
   "player.left": { serverId: string; player: string };
   "user.login": { userId: string; ip: string };
+  /**
+   * a change made through the panel (editor, upload, delete, rename, new folder, archive, extract).
+   * path is relative to the server folder, a bulk operation fires once per top level path
+   */
   "file.changed": { serverId: string; path: string };
 }
 
@@ -236,6 +271,7 @@ export interface ExtServersApi {
   start(id: string): Promise<void>;
   /** servers:control */
   stop(id: string): Promise<void>;
+  /** servers:read and events:logs, stops on its own when the extension is disabled */
   onLog(id: string, cb: (line: InstanceLog) => void): Unsubscribe;
   /**
    * Ports the server listens on 127.0.0.1, server.properties wins for the primary one
@@ -311,22 +347,38 @@ export interface KeyValueStore {
   keys(): string[];
 }
 
+/** Values of the settings form, see settingsSchema */
 export interface ExtConfigApi {
+  /** saved value, or the settingsSchema default */
   get<T = unknown>(key: string): T;
   set(key: string, value: unknown): void;
   all(): Record<string, unknown>;
 }
 
+/** Tasks show up in the panel task list like the panel's own and fire task.* events */
 export interface ExtTasksApi {
-  create(type: string, payload: unknown): string;
-  update(taskId: string, patch: { progress?: number; status?: string; message?: string }): void;
+  /**
+   * Starts a running task and returns its id. payload.title is the label in the task list,
+   * payload.serverId ties it to a server. Created inside a route or a command it belongs to that user
+   */
+  create(type: string, payload?: unknown): string;
+  /**
+   * progress is 0-100. status "success" finishes it, "failed" fails it with message as the error,
+   * "cancelled" cancels it, "running" keeps it going. Only tasks of this extension can be updated
+   */
+  update(
+    taskId: string,
+    patch: { progress?: number; status?: "running" | "success" | "failed" | "cancelled" | (string & {}); message?: string },
+  ): void;
 }
 
+/** Shows up in the panel command palette for users that have permission */
 export interface ExtCommand {
   id: string;
   title: string;
   icon?: string;
   permission?: string;
+  /** what it does is written to the audit log under the user who ran it, a throw shows as an error */
   run(): void | Promise<void>;
 }
 
@@ -390,14 +442,15 @@ export interface KubekRuntime {
   /**
    * shadcn-style UI kit: Button, Input, Label, Badge, Separator, Card, CardContent, CardHeader, CardTitle,
    * and since Kubek 4.1.3 Switch, Alert, AlertTitle, AlertDescription, Dialog, DialogContent, DialogHeader,
-   * DialogTitle, DialogDescription, DialogBody, DialogFooter, Tooltip, TooltipTrigger, TooltipContent
+   * DialogTitle, DialogDescription, DialogBody, DialogFooter, Tooltip, TooltipTrigger, TooltipContent,
+   * InfoCard (a card of the console rail: icon, tone, label, value, action) and CopyButton
    */
   ui: Record<string, any>;
   /** lucide-react icon components by name */
   icons: Record<string, any>;
   /** the panel's typed API client (host-defined) */
   api: unknown;
-  /** auth'd HTTP client; paths are relative to /api (e.g. "ext/<id>/route") */
+  /** auth'd HTTP client; paths are relative to /api (e.g. "ext/<id>/route"), throws KubekHttpError */
   http: {
     get: <T>(path: string) => Promise<T>;
     post: <T = unknown>(path: string, json?: unknown) => Promise<T>;
@@ -410,11 +463,13 @@ export interface KubekRuntime {
       queryFn: () => Promise<T>;
       enabled?: boolean;
       refetchInterval?: number;
+      meta?: KubekQueryMeta;
     }) => KubekQueryResult<T>;
     useMutation: <TArgs = void>(opts: {
       mutationFn: (args: TArgs) => Promise<unknown>;
       onSuccess?: () => void;
       onError?: (error: unknown) => void;
+      meta?: KubekQueryMeta;
     }) => KubekMutationResult<TArgs>;
     useQueryClient: () => { invalidateQueries: (opts: { queryKey: unknown[] }) => void };
   };
@@ -427,6 +482,15 @@ export interface KubekRuntime {
   };
   /** navigate within the panel SPA */
   navigate: (path: string) => void;
+}
+
+/** silent: no panel toast on error, the extension shows it itself */
+export type KubekQueryMeta = { silent?: boolean };
+
+/** What window.Kubek.http throws on a non 2xx answer, body is what the route sent. @since Kubek 4.1.3 */
+export interface KubekHttpError extends Error {
+  status: number;
+  body: unknown;
 }
 
 /** Subset of react-query's UseQueryResult exposed to extensions */
